@@ -27,7 +27,20 @@ def residual_block(inp, output_dim, leakiness = None):
 
     return inp.apply(tf.add, residual).apply(leaky_rectify, leakiness=0.2)
 
-class DiscriminatorNetwork:
+class TrainableNetwork:
+    def build_train_op(self, loss):
+        self.learning_rate = tf.placeholder(tf.float32, shape=() )
+        train_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope = self.scope.name)
+        # for var in train_vars:
+        #     print(var.name)
+        optimizer = tf.train.AdamOptimizer(self.learning_rate)
+        self.train_op = pt.apply_optimizer(optimizer, losses=[loss], var_list=train_vars)
+
+    def train(self, sess, learning_rate, **feed_dict):
+        feed_dict[self.learning_rate] = learning_rate
+        sess.run(self.train_op, feed_dict)
+
+class DiscriminatorNetwork(TrainableNetwork):
     def __init__(self, df_dim):
         self.df_dim = df_dim
 
@@ -36,7 +49,7 @@ class DiscriminatorNetwork:
         '''
         l = pt.wrap(image)
 
-        node1_0 = \
+        l = \
             (l.  # s * s * 3
              custom_conv2d(self.df_dim, k_h=4, k_w=4).  # s2 * s2 * df_dim
              apply(leaky_rectify, leakiness=0.2).
@@ -48,9 +61,13 @@ class DiscriminatorNetwork:
              custom_conv2d(self.df_dim * 8, k_h=4, k_w=4).  # s16 * s16 * df_dim*8
              conv_batch_norm())
         
-        node1 = node1_0.residual_block(self.df_dim * 8, leakiness = 0.2)
+        channels = self.df_dim * 8
+        l = l.residual_block(channels, leakiness = 0.2)
 
-        return node1
+        l = l.conv2d(1, channels, bias=None).conv_batch_norm().apply(leaky_rectify, leakiness = 0.2)
+
+        l = l.conv2d(l.get_shape().as_list()[1:3], 1, bias=None).flatten()
+        return l
 
     def get_loss(self, predictions, label):
         return tf.nn.sigmoid_cross_entropy_with_logits(predictions, label)
@@ -60,14 +77,16 @@ class DiscriminatorNetwork:
         '''
         with tf.variable_scope('discriminator'):
             truth_prob = self.classifier(truth_image)
-            truth_loss = self.get_loss(truth_prob, tf.ones(tf.shape(truth_image)[0]))
+            truth_loss = self.get_loss(truth_prob, tf.ones_like(truth_prob))
 
-        with tf.variable_scope('discriminator', reuse=True):
+        with tf.variable_scope('discriminator', reuse=True) as scope:
             synthesis_proba = self.classifier(synthesis_image)
-            synthesis_loss =  self.get_loss(synthesis_proba, tf.zeros(tf.shape(synthesis_image)[0]))
-            adv_loss =  self.get_loss(synthesis_proba, tf.ones(tf.shape(synthesis_image)[0]))
+            synthesis_loss =  self.get_loss(synthesis_proba, tf.zeros_like(synthesis_proba))
+            adv_loss =  self.get_loss(synthesis_proba, tf.ones_like(synthesis_proba))
+            self.scope = scope
 
         return truth_loss + synthesis_loss, adv_loss
+
 
 class FeatureNetwork:
     def __init__(self, layer_weight):
@@ -83,35 +102,87 @@ class FeatureNetwork:
 
         return sum(self.layer_weight[l] * opr_l2_loss(res_1[l] - res_2[l]) for l in self.layer_weight)
 
+class GeneratorNetwork(TrainableNetwork):
+    def __init__(self, channels, num_downsamp, num_residual):
+        self.num_downsamp = num_downsamp
+        self.num_residual = num_residual
+
+        assert channels % (2 ** (num_downsamp + 1)) == 0, "Invalid internal channels"
+        self.channels = channels // (2 ** (num_downsamp + 1)) 
+
+    def build(self, sketch_image, coarse_image = None, **kwargs):
+        '''A generator for generating image
+        '''
+        with tf.variable_scope('generator') as scope:
+            net = pt.wrap(sketch_image).sequential()
+
+            channels = self.channels
+            net.conv2d(3, channels, stride = 2, activation_fn=tf.nn.relu)
+
+            for i in range(self.num_downsamp + 1):
+                channels *= 2
+                net.conv2d(3, channels, stride = 2, bias=None).conv_batch_norm().apply(tf.nn.relu)
+
+            for i in range(self.num_residual):
+                net.residual_block(channels)
+
+
+            output_shape = list(map(lambda x : x // 2, self.get_output_shape(kwargs['sketch_shape'])))
+            
+            for i in range(2):
+                net.apply(tf.image.resize_nearest_neighbor, [output_shape[0] * (2 ** i), output_shape[1] * (2 ** i)])
+                channels = int(channels / 2)
+                net.conv2d(3, channels, bias=None).conv_batch_norm().apply(tf.nn.relu)
+
+            net.conv2d(1, 3, bias=None).apply(tf.nn.tanh)
+            self.scope = scope
+
+        return net
+
+    def get_output_shape(self, shape):
+        return list(map(lambda x : x // (2 ** self.num_downsamp), shape))
+
 class GenerativeModel:
-    def __init__(self, name, d_net, f_net, losses_weight, coarse_input=True, **kwargs):
+    def __init__(self, name, d_net, f_net, g_net, losses_weight, coarse_input=True, **kwargs):
         with tf.variable_scope(name):
-            sketch_image = tf.placeholder(tf.float32, shape=[None] + kwargs['sketch_shape'] + [3])
+            sketch_image = tf.placeholder(tf.float32, shape=[None] + list(kwargs['sketch_shape']) + [3],
+                name = 'sketch_image')
             
             if coarse_input:
                 if 'coarse_image' in kwargs:
                     coarse_image = kwargs['corase_image']
                 else:
-                    coarse_image = tf.placeholder(tf.float32, shape=[None] + kwargs['coarse_shape'] + [3])
+                    coarse_image = tf.placeholder(tf.float32, 
+                        shape=[None] + list(kwargs['coarse_shape']) + [3],
+                        name = 'coarse_image')
             else:
                 coarse_image = None
 
-            output_image = self.generator(sketch_image, coarse_image)
-
-            truth_image = tf.placeholder(tf.float32, shape=tf.shape(output_image))
-            other_truth_image = tf.placeholder(tf.float32, shape=tf.shape(output_image))
+            self.g_net = g_net
+            output_image = g_net.build(sketch_image, coarse_image, **kwargs)
+            kwargs['output_shape'] = g_net.get_output_shape(kwargs['sketch_shape'])
+            truth_image = tf.placeholder(tf.float32, shape=[None] + list(kwargs['output_shape']) + [3],
+                name = 'truth_image')
+            other_truth_image = tf.placeholder(tf.float32, shape=[None] + list(kwargs['output_shape']) + [3],
+                name = 'other_image')
             
             self.losses = dict()
             self.d_net = d_net
             self.d_loss, self.losses['adv'] = d_net.build(other_truth_image, output_image)
-            self.losses['fea'] = f_net.build(truth_image, output_image)
+            # self.losses['fea'] = f_net.build(truth_image, output_image)
             self.losses['pixel'] = opr_l2_loss(truth_image - output_image)
 
             self.losses_weight = losses_weight
             self.g_loss = sum(self.losses[k] * self.losses_weight[k] for k in self.losses_weight)
+            self.shapes = kwargs
 
-    def generator(self, sketch_image, coarse_image = None):
-        '''A generator for generating image
-        '''
-
+            self.g_net.build_train_op(self.g_loss)
+            self.d_net.build_train_op(self.d_loss)
     
+baseline = GenerativeModel('network1', 
+    d_net = DiscriminatorNetwork(32),  
+    f_net = FeatureNetwork('relu2_2'), 
+    g_net = GeneratorNetwork(64, 0, 5),
+    losses_weight = dict(adv=1e6, pixel=1),
+    coarse_input = False,
+    sketch_shape = (128, 128) )
