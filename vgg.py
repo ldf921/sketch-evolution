@@ -18,9 +18,12 @@ def net(input_image, network_path = 'imagenet-vgg-verydeep-19.mat'):
         'relu5_3', 'conv5_4', 'relu5_4'
     )
 
+
     data = scipy.io.loadmat(network_path)
     mean = data['normalization'][0][0][0]
     mean_pixel = np.mean(mean, axis=(0, 1))
+    if input_image is None:
+        return mean_pixel
     weights = data['layers'][0]
 
     net = {}
